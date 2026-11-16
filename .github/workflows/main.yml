@@ -1,0 +1,105 @@
+name: Run Minecraft server
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_minutes:
+        description: Minutes to keep the server running (1-330)
+        required: true
+        default: "300"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: minecraft-server-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Restore latest world backup
+        run: |
+          if [[ -f world-backups/latest.tar.gz ]]; then
+            tar -xzf world-backups/latest.tar.gz -C paper
+          fi
+
+      - name: Run server
+        id: server
+        continue-on-error: true
+        working-directory: paper
+        env:
+          RUN_MINUTES: ${{ inputs.run_minutes }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RUN_MINUTES" =~ ^[0-9]+$ ]] || (( RUN_MINUTES < 1 || RUN_MINUTES > 330 )); then
+            echo "run_minutes must be between 1 and 330." >&2
+            exit 1
+          fi
+
+          if [[ ! -f paper-26.3-253.jar ]]; then
+            ./download-paper.sh
+          fi
+
+          set +e
+          timeout --signal=TERM --kill-after=60s "${RUN_MINUTES}m" ./start.sh </dev/null
+          server_status=$?
+          set -e
+
+          if (( server_status == 124 )); then
+            echo "Server stopped after the requested run time."
+            exit 0
+          fi
+          exit "$server_status"
+
+      - name: Back up world and commit it
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ ! -d paper/world ]]; then
+            echo "World directory is missing; refusing to create an empty backup." >&2
+            exit 1
+          fi
+
+          mkdir -p world-backups
+          backup_tmp="$(mktemp world-backups/latest.tar.gz.XXXXXX)"
+          trap 'rm -f -- "$backup_tmp"' EXIT
+          worlds=(world)
+          for world in world_nether world_the_end; do
+            if [[ -d "paper/$world" ]]; then
+              worlds+=("$world")
+            fi
+          done
+          tar -czf "$backup_tmp" -C paper "${worlds[@]}"
+          if (( $(stat -c '%s' "$backup_tmp") >= 104857600 )); then
+            echo "Compressed backup is at least 100 MiB, exceeding GitHub's file size limit." >&2
+            exit 1
+          fi
+          mv -- "$backup_tmp" world-backups/latest.tar.gz
+          trap - EXIT
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add world-backups/latest.tar.gz
+          if git diff --cached --quiet; then
+            echo "World backup is unchanged; nothing to commit."
+            exit 0
+          fi
+          git commit -m "Back up Minecraft world"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Fail if the server exited unexpectedly
+        if: steps.server.outcome == 'failure'
+        run: exit 1
